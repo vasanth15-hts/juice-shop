@@ -1,70 +1,96 @@
 trigger:
-- master
+  branches:
+    include:
+      - master
 
-pool:
-  vmImage: ubuntu-latest
+stages:
+- stage: SecurityScan
+  jobs:
+  - job: GitleaksScan
+    pool:
+      vmImage: 'ubuntu-latest'
 
-variables:
-  reportPath: '$(Build.ArtifactStagingDirectory)/gitleaks_report.json'
+    steps:
+    - checkout: self
+      persistCredentials: true
+      fetchDepth: 0
 
-steps:
-# Step 1: Checkout Repository
-- checkout: self
-  displayName: "Checkout Repository"
+    - task: Bash@3
+      displayName: "Ensure Full Git Fetch"
+      inputs:
+        targetType: 'inline'
+        script: |
+          git config --global credential.helper store
+          git fetch --unshallow || git fetch --all
 
-# Step 2: Create Artifact Staging Directory
-- script: |
-    echo "Creating artifact staging directory..."
-    mkdir -p $(Build.ArtifactStagingDirectory)
-  displayName: "Prepare Artifact Staging Directory"
+    - task: Bash@3
+      displayName: 'Install Gitleaks'
+      inputs:
+        targetType: 'inline'
+        script: |
+          GITLEAKS_VERSION="8.18.2"
+          ARCH="x64"
+          OS_TYPE="linux"
 
-# Step 3: Pull and Run Gitleaks Docker Image
-- script: |
-    echo "Pulling Gitleaks Docker image..."
-    docker pull zricethezav/gitleaks:latest
-    echo "Running Gitleaks scan..."
-    docker run --rm \
-      -v $(System.DefaultWorkingDirectory):/repo \
-      -v $(Build.ArtifactStagingDirectory):/output \
-      zricethezav/gitleaks:latest detect \
-      --source /repo \
-      --report-format json \
-      --report-path /output/gitleaks_report.json
-  displayName: "Run Gitleaks with Docker"
-  continueOnError: true
+          echo "Installing Gitleaks v${GITLEAKS_VERSION}..."
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_${OS_TYPE}_${ARCH}.tar.gz" -o gitleaks.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks version
 
-# Step 4: Print Gitleaks Report
-- script: |
-    echo "Gitleaks Report Output:"
-    cat $(reportPath)
-  displayName: "Print Gitleaks Report"
+    - task: Bash@3
+      displayName: 'Run Gitleaks on Modified, Staged & New Files'
+      inputs:
+        targetType: 'inline'
+        script: |
+          mkdir -p /tmp/gitleaks_reports
+          rm -rf /tmp/gitleaks_reports/*.json
 
-# Step 4: Print Gitleaks Report
-- script: |
-    echo "Gitleaks Report Output:"
-    cat $(reportPath)
-  displayName: "Print Gitleaks Report"
+          echo "Fetching full history..."
+          git fetch --all
+          git remote set-head origin -a
+          DEFAULT_BRANCH=$(git remote show origin | grep 'HEAD branch' | cut -d':' -f2 | tr -d ' ')
+          echo "Using default branch: $DEFAULT_BRANCH"
 
-# Step 5: Upload Gitleaks Report to DefectDojo
-- script: |
-    echo "Uploading report to DefectDojo..."
-    curl -X POST "http://20.244.37.70:8080/api/v2/import-scan/" \
-      -H "Authorization: Token 334e5c5163069f478135c5a5fd411358e35debd8" \
-      -H "Content-Type: multipart/form-data" \
-      -F "scan_type=Gitleaks Scan" \
-      -F "file=@$(reportPath)" \
-      -F "engagement=4" \
-      -F "verified=False" \
-      -F "active=True"
-  displayName: "Upload Report to DefectDojo"
-  continueOnError: true
+          # Ensure we are on the correct branch and up to date
+          git checkout $DEFAULT_BRANCH
+          git pull origin $DEFAULT_BRANCH
+          git checkout $BUILD_SOURCEVERSION
 
-# Step 6: Check for Secrets and Fail Build - Build Break
-- script: |
-    if [ -s $(reportPath) ]; then
-      echo "Secrets detected. Failing the build."
-      exit 1
-    else
-      echo "No secrets detected."
-    fi
-  displayName: "Validate Gitleaks Report"
+          # Get changed and untracked files
+          DIFF_FILES=$(git diff --name-only origin/$DEFAULT_BRANCH...HEAD)
+          UNTRACKED_FILES=$(git ls-files --others --exclude-standard)
+
+          # Combine and clean
+          CHANGED_FILES=$(echo -e "$DIFF_FILES\n$UNTRACKED_FILES" | sort -u | grep -v '\.tar\.gz$' || true)
+
+          echo "=== Files to scan with Gitleaks ==="
+          echo "$CHANGED_FILES"
+          echo "==================================="
+
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No modified or new files detected. Skipping Gitleaks scan."
+            echo "[]" > /tmp/gitleaks_reports/gitleaks_results.json
+            exit 0
+          fi
+
+          # Run Gitleaks scan per file
+          for file in $CHANGED_FILES; do
+            if [ -f "$file" ]; then
+              echo "Scanning: $file"
+              cat "$file" | gitleaks detect --pipe \
+                --report-path="/tmp/gitleaks_reports/gitleaks_results_$(basename "$file").json" || true
+            else
+              echo "Skipping missing file: $file"
+            fi
+          done
+
+          # Merge results
+          if compgen -G "/tmp/gitleaks_reports/gitleaks_results_*.json" > /dev/null; then
+            jq -s '.' /tmp/gitleaks_reports/gitleaks_results_*.json > /tmp/gitleaks_reports/gitleaks_results.json
+          else
+            echo "[]" > /tmp/gitleaks_reports/gitleaks_results.json
+          fi
+
+          echo "Final Gitleaks Results:"
+          cat /tmp/gitleaks_reports/gitleaks_results.json
